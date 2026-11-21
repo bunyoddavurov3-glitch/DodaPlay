@@ -309,6 +309,9 @@ class MovieAPI:
             relevant = items[:18]
             matched = await asyncio.gather(*(in_country(item) for item in relevant))
             items = [item for item, yes in zip(relevant, matched) if yes]
+        # Taklif variantlari qat'iy yangi yildan eski yilga qarab chiqadi.
+        # Sana topilmagan natija eng oxirida ko'rsatiladi.
+        items.sort(key=lambda item: item.date or "0000-00-00", reverse=True)
         return items[:5]
 
     async def imdb(self, imdb_id: Optional[str]) -> dict:
@@ -604,7 +607,7 @@ async def query_private(message: types.Message) -> None:
         exact = [m for m in items if norm(title) in (norm(m.title), norm(m.original_title))]
         if len(items) == 1 or len(exact) == 1:
             await message.answer(await make_caption((exact or items)[0].tmdb_id),
-                                 disable_web_page_preview=True)
+                                 parse_mode="HTML", disable_web_page_preview=True)
             return
         await message.answer(
             "🎬 Mos filmlardan birini tanlang:",
@@ -628,7 +631,8 @@ async def choose_movie(call: types.CallbackQuery) -> None:
     try:
         caption = await make_caption(movie_id)
         if call.message:
-            await call.message.edit_text(caption, disable_web_page_preview=True)
+            await call.message.edit_text(caption, parse_mode="HTML",
+                                         disable_web_page_preview=True)
     except Exception:
         LOG.exception("Movie selection failed")
         if call.message:
