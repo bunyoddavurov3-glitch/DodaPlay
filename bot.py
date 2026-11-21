@@ -371,7 +371,7 @@ class MovieAPI:
 
     async def imdb_rating_fallback(self, imdb_id: Optional[str]) -> Optional[float]:
         """IMDb rasmiy ochiq reyting datasetidan olingan Agregarr keshli API."""
-        if not imdb_id or not re.fullmatch(r"tt\\d{7,10}", imdb_id):
+        if not imdb_id or not re.fullmatch(r"tt\d{7,10}", imdb_id):
             return None
         key = ("imdb-rating", imdb_id)
         cached = cache_get(key)
