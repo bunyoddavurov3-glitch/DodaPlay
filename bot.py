@@ -202,6 +202,7 @@ class MovieOption:
     year: str
     date: str
     popularity: float
+    vote_count: int = 0
 
     @property
     def label(self) -> str:
@@ -252,20 +253,53 @@ class MovieAPI:
         params: dict[str, Any] = {"query": title, "include_adult": "false"}
         if year:
             params["year"] = year
-        search = await self.tmdb("/search/movie", params)
+
+        # TMDB qidiruvi mashhur trilogiya qismlarini birinchi sahifada
+        # bermasligi mumkin. Yilsiz keng qidiruvda faqat 2 sahifa tekshiriladi.
+        first = await self.tmdb("/search/movie", params)
+        raw = list(first.get("results") or [])
+        if not year and int(first.get("total_pages") or 1) > 1:
+            second = await self.tmdb("/search/movie", dict(params, page=2))
+            raw.extend(second.get("results") or [])
+
         items = []
-        for x in search.get("results") or []:
-            if not x.get("id"):
+        seen: set[int] = set()
+        for x in raw:
+            if not isinstance(x, dict) or not x.get("id"):
                 continue
+            movie_id = int(x["id"])
+            if movie_id in seen:
+                continue
+            seen.add(movie_id)
             date = str(x.get("release_date") or "")
+            # Noto‘g‘ri yoki to‘liq bo‘lmagan sanaga aniq yil bermaymiz.
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+                date = ""
             if year and not date.startswith(str(year)):
                 continue
             items.append(MovieOption(
-                tmdb_id=int(x["id"]), title=str(x.get("title") or ""),
+                tmdb_id=movie_id, title=str(x.get("title") or ""),
                 original_title=str(x.get("original_title") or ""),
                 year=date[:4] or "—", date=date,
                 popularity=float(x.get("popularity") or 0),
+                vote_count=int(x.get("vote_count") or 0),
             ))
+
+        target = norm(title)
+        def score(m: MovieOption) -> tuple:
+            names = (norm(m.title), norm(m.original_title))
+            exact = target in names
+            # Nomdan keyin bo‘lim/qo‘shimcha nom bo‘lsa, uni tegishli davom
+            # sifatida ko‘ramiz; qisqa fanfilmni reytingga ko‘tarib yubormaymiz.
+            prefix = any(n.startswith(target) for n in names if n)
+            similarity = max(SequenceMatcher(None, target, n).ratio()
+                             for n in names if n) if any(names) else 0.0
+            year_known = bool(m.date)
+            return (int(exact), int(prefix), int(year_known),
+                    m.vote_count, similarity, m.popularity)
+
+        # Mamlakat filt­ridan oldin ham relevant nomlar saralanadi.
+        items.sort(key=score, reverse=True)
         if country:
             async def in_country(opt: MovieOption) -> bool:
                 d = await self.details(opt.tmdb_id)
@@ -275,13 +309,7 @@ class MovieAPI:
             relevant = items[:18]
             matched = await asyncio.gather(*(in_country(item) for item in relevant))
             items = [item for item, yes in zip(relevant, matched) if yes]
-        target = norm(title)
-        def score(m: MovieOption) -> tuple:
-            exact = target in (norm(m.title), norm(m.original_title))
-            similarity = max(SequenceMatcher(None, target, norm(m.title)).ratio(),
-                             SequenceMatcher(None, target, norm(m.original_title)).ratio())
-            return (int(exact), similarity, m.popularity)
-        return sorted(items, key=score, reverse=True)[:5]
+        return items[:5]
 
     async def imdb(self, imdb_id: Optional[str]) -> dict:
         if not imdb_id or not OMDB_KEY:
