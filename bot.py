@@ -57,6 +57,14 @@ COUNTRIES = {
     "JAPAN": ("JP", "Yaponiya"), "YAPONIYA": ("JP", "Yaponiya"),
     "CHINA": ("CN", "Xitoy"), "XITOY": ("CN", "Xitoy"),
     "TURKEY": ("TR", "Turkiya"), "TURKIYA": ("TR", "Turkiya"),
+    "ЯПОНИЯ": ("JP", "Yaponiya"), "КИТАЙ": ("CN", "Xitoy"),
+    "ГЕРМАНИЯ": ("DE", "Germaniya"), "ФРАНЦИЯ": ("FR", "Fransiya"),
+    "ВЕЛИКОБРИТАНИЯ": ("GB", "Buyuk Britaniya"),
+    "КАНАДА": ("CA", "Kanada"), "АВСТРАЛИЯ": ("AU", "Avstraliya"),
+    "ИТАЛИЯ": ("IT", "Italiya"), "ИСПАНИЯ": ("ES", "Ispaniya"),
+    "БРАЗИЛИЯ": ("BR", "Braziliya"), "МЕКСИКА": ("MX", "Meksika"),
+    "ТУРЦИЯ": ("TR", "Turkiya"), "ИНДОНЕЗИЯ": ("ID", "Indoneziya"),
+    "ТАИЛАНД": ("TH", "Tailand"),
 }
 COUNTRY_BY_ISO = {
     "US": "AQSH", "GB": "Buyuk Britaniya", "RU": "Rossiya",
@@ -80,6 +88,18 @@ GENRES = {
     "комедия": "komediya", "боевик": "jangari",
     "ужасы": "qo‘rqinchli", "триллер": "triller",
     "драма": "drama", "детектив": "detektiv",
+    "криминал": "jinoyat", "фантастика": "fantastika",
+    "фэнтези": "fantastika", "семейный": "oilaviy",
+    "приключения": "sarguzasht", "мелодрама": "melodrama",
+    "романтика": "romantik", "история": "tarixiy",
+    "военный": "urush", "война": "urush",
+    "документальный": "hujjatli", "биография": "biografiya",
+    "музыка": "musiqa", "мультфильм": "animatsiya",
+    "мультфильмы": "animatsiya", "аниме": "anime",
+    "спорт": "sport", "вестерн": "vestern",
+    "детский": "bolalar uchun", "короткометражка": "qisqa metrajli",
+    "короткометражный": "qisqa metrajli", "мюзикл": "musiqali",
+    "фильм-нуар": "nuar", "биографический": "biografiya",
 }
 RATING_AGES = {
     "G": "0+", "TV-Y": "0+", "TV-G": "0+",
@@ -315,7 +335,10 @@ API = MovieAPI()
 
 def local_country(name: str) -> str:
     raw = str(name or "").strip()
-    return COUNTRIES.get(raw.upper(), (None, raw))[1] or raw
+    if not raw:
+        return ""
+    key = re.sub(r"\s+", " ", raw).upper()
+    return COUNTRY_BY_ISO.get(key) or COUNTRIES.get(key, (None, raw))[1] or raw
 
 
 def country_list(value: str) -> str:
@@ -332,14 +355,26 @@ def country_line(items: list[dict], key: str) -> str:
             names.append(name)
     return ", ".join(names) if names else "Mavjud emas"
 
+def local_genre(raw: str) -> str:
+    """Janrni faqat o‘zbekcha ma’noda ko‘rsatish; begona atamani uzatmaslik."""
+    name = re.sub(r"\s+", " ", str(raw or "").strip())
+    if not name:
+        return ""
+    if name in GENRES:
+        return GENRES[name]
+    mapped = {key.casefold(): value for key, value in GENRES.items()}
+    # API ba'zan vergul bilan yoki katta harfda qaytaradi.
+    return mapped.get(name.casefold(), "")
+
+
+def genre_list(raw: str) -> str:
+    items = [local_genre(part) for part in str(raw or "").split(",")]
+    unique = list(dict.fromkeys(value for value in items if value))
+    return ", ".join(unique) if unique else "Mavjud emas"
+
+
 def genre_line(items: list[dict], field: str = "name") -> str:
-    tags = []
-    for x in items:
-        name = str(x.get(field) or "").strip()
-        uz = GENRES.get(name) or GENRES.get(name.casefold()) or name
-        if uz and uz not in tags:
-            tags.append(uz)
-    return ", ".join(tags) if tags else "Mavjud emas"
+    return genre_list(", ".join(str(x.get(field) or "") for x in items if isinstance(x, dict)))
 
 def age_from_rating(raw: Any) -> str:
     text = str(raw or "").strip().upper()
@@ -395,10 +430,7 @@ async def make_caption(movie_id: int) -> str:
     tmdb_countries = country_line(d.get("production_countries") or [], "name")
     tmdb_genres = genre_line(d.get("genres") or [])
     omdb_country = country_list(omdb.get("Country") or "")
-    omdb_genres = ", ".join(
-        GENRES.get(x.strip(), x.strip()) for x in str(omdb.get("Genre") or "").split(",")
-        if x.strip()
-    ) or "Mavjud emas"
+    omdb_genres = genre_list(omdb.get("Genre") or "")
     kp_countries = country_line(kp.get("countries") or [], "country")
     kp_genres = genre_line(kp.get("genres") or [], "genre")
     kp_age = age_from_rating(kp.get("ratingAgeLimits"))
@@ -418,7 +450,8 @@ async def make_caption(movie_id: int) -> str:
         f'Yosh chegarasi: {esc(age_from_rating(omdb.get("Rated")))}\n'
         f'Janri: {esc(omdb_genres)}\n\n'
         f'{heading("KINOPOISK", kp_link)}\n'
-        f'Davlati: {esc(kp_countries)}\n'
+        + (f'{esc(kp_link)}\n' if kp_link else "")
+        + f'Davlati: {esc(kp_countries)}\n'
         f'Reytingi: {esc(kp_rating)}\n'
         f'Yosh chegarasi: {esc(kp_age)}\n'
         f'Janri: {esc(kp_genres)}'
