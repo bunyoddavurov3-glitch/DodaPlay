@@ -14,6 +14,8 @@ from typing import Any, Optional
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle,
@@ -691,7 +693,9 @@ async def main() -> None:
     DB = AccessDB()
     dp = Dispatcher()
     dp.include_router(ROUTER)
-    bot = Bot(token=BOT_TOKEN)
+    # Yagona HTML sozlama: send_message, answer va edit_text xabarlarida
+    # <b>, <code>, <a> teglar oddiy matn sifatida chiqib qolmaydi.
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     async with aiohttp.ClientSession(
         headers={"User-Agent": "DodaPlayAiBot/1.0"},
     ) as session:
