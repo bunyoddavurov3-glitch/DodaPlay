@@ -38,6 +38,12 @@ TMDB_API = "https://api.themoviedb.org/3"
 CACHE: dict[tuple, tuple[float, Any]] = {}
 CACHE_MAX = 800
 
+# Faqat bir xil film ekanligi foydalanuvchi yuborgan rasm/havolalar bilan
+# tasdiqlangan istisnolar. Qolgan barcha filmlar API orqali aniqlanadi.
+VERIFIED_EXTERNAL_IDS = {
+    1384514: {"imdb": "tt34498564", "kinopoisk": 14246389},
+}
+
 COUNTRIES = {
     "AQSH": ("US", "AQSH"), "USA": ("US", "AQSH"),
     "US": ("US", "AQSH"), "UNITED STATES": ("US", "AQSH"),
@@ -264,7 +270,9 @@ class MovieAPI:
                 ) as res:
                     if res.status != 200:
                         LOG.warning("API HTTP %s for %s", res.status, url.split("?")[0])
-                        return {}
+                        # Xato javobni juda qisqa muddatga keshlash: API
+                        # vaqtincha ishdan chiqqanda tez-tez urib turmaymiz.
+                        return cache_put(key, {}, 45)
                     data = await res.json(content_type=None)
                     return cache_put(key, data if isinstance(data, dict) else {})
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
@@ -353,49 +361,116 @@ class MovieAPI:
         if not imdb_id or not OMDB_KEY:
             return {}
         data = await self.get("https://www.omdbapi.com/", {"apikey": OMDB_KEY, "i": imdb_id})
-        return data if data.get("Response") == "True" else {}
+        if data.get("Response") != "True":
+            LOG.info("OMDb has no record for IMDb %s (or API unavailable).", imdb_id)
+            return {}
+        # An explicit ID lookup must return the requested title.
+        if data.get("imdbID") and data["imdbID"] != imdb_id:
+            return {}
+        return data
+
+    async def imdb_rating_fallback(self, imdb_id: Optional[str]) -> Optional[float]:
+        """IMDb rasmiy ochiq reyting datasetidan olingan Agregarr keshli API."""
+        if not imdb_id or not re.fullmatch(r"tt\\d{7,10}", imdb_id):
+            return None
+        key = ("imdb-rating", imdb_id)
+        cached = cache_get(key)
+        if cached is not None:
+            return cached if isinstance(cached, float) else None
+        if not self.http:
+            return None
+        try:
+            async with self.limit:
+                async with self.http.get(
+                    "https://api.agregarr.org/api/ratings",
+                    params={"id": imdb_id},
+                    timeout=aiohttp.ClientTimeout(total=6),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json(content_type=None)
+                    if not isinstance(data, list):
+                        return None
+                    for item in data:
+                        if not isinstance(item, dict) or item.get("imdbId") != imdb_id:
+                            continue
+                        value = item.get("rating")
+                        if value is None:
+                            return None
+                        rating = float(value)
+                        if 0 < rating <= 10:
+                            return cache_put(key, rating, 3600)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError):
+            LOG.info("Secondary IMDb rating lookup unavailable for %s", imdb_id)
+        return None
 
     async def kinopoisk(self, title: str, original: str,
-                       year: str, imdb_id: Optional[str]) -> tuple[dict, Optional[int]]:
+                       year: str, imdb_id: Optional[str],
+                       known_id: Optional[int] = None) -> tuple[dict, Optional[int]]:
         if not KP_KEY:
             return {}, None
         headers = {"X-API-KEY": KP_KEY, "Accept": "application/json"}
-        data = await self.get(
-            "https://kinopoiskapiunofficial.tech/api/v2.1/films/search-by-keyword",
-            {"keyword": original or title, "page": 1}, headers,
-        )
-        candidates = data.get("films") or []
+        base = "https://kinopoiskapiunofficial.tech"
         expected = {norm(title), norm(original)} - {""}
-        ranked = []
-        for x in candidates:
-            if not isinstance(x, dict) or not x.get("filmId"):
-                continue
-            if year != "—" and str(x.get("year") or "") != year:
-                continue
-            names = {norm(x.get("nameEn")), norm(x.get("nameRu"))} - {""}
-            exact = bool(names & expected)
-            similarity = max(
-                (SequenceMatcher(None, e, n).ratio()
-                 for e in expected for n in names), default=0,
-            )
-            if exact or similarity >= 0.91:
-                ranked.append((int(exact), similarity, int(x["filmId"])))
-        if not ranked:
-            return {}, None
-        ranked.sort(reverse=True)
-        film_id = ranked[0][2]
-        detail = await self.get(
-            f"https://kinopoiskapiunofficial.tech/api/v2.2/films/{film_id}",
-            headers=headers,
-        )
-        if not detail:
-            return {}, None
-        # Avoid attaching an unrelated film with a similar translated title.
-        if imdb_id and detail.get("imdbId") and detail["imdbId"] != imdb_id:
-            return {}, None
-        if year != "—" and str(detail.get("year") or "") != year:
-            return {}, None
-        return detail, film_id
+
+        async def validated(film_id: int) -> tuple[dict, Optional[int]]:
+            detail = await self.get(f"{base}/api/v2.2/films/{film_id}", headers=headers)
+            if not detail or not detail.get("kinopoiskId"):
+                return {}, None
+            found_imdb = str(detail.get("imdbId") or "")
+            if imdb_id and found_imdb and found_imdb != imdb_id:
+                return {}, None
+            if year != "—" and str(detail.get("year") or "") != year:
+                return {}, None
+            names = {norm(detail.get(k)) for k in ("nameEn", "nameOriginal", "nameRu")} - {""}
+            # ISBN kabi IDga emas, tasdiqlangan IMDb ID yoki yaqin nomga ishonamiz.
+            same_imdb = bool(imdb_id and found_imdb == imdb_id)
+            similarity = max((SequenceMatcher(None, a, b).ratio()
+                              for a in expected for b in names), default=0)
+            if not (same_imdb or similarity >= 0.84 or (known_id and film_id == known_id)):
+                return {}, None
+            return detail, film_id
+
+        if known_id:
+            detail, matched_id = await validated(known_id)
+            if detail:
+                return detail, matched_id
+
+        # Eng aniq usul — IMDb ID; nom bir tilda boshqacha bo‘lsa ham topiladi.
+        if imdb_id:
+            filtered = await self.get(f"{base}/api/v2.2/films",
+                                      {"imdbId": imdb_id, "page": 1}, headers)
+            for item in (filtered.get("items") or [])[:10]:
+                film_id = item.get("kinopoiskId")
+                if film_id:
+                    detail, matched_id = await validated(int(film_id))
+                    if detail:
+                        return detail, matched_id
+
+        # Eski keyword endpoint 500 qaytarishi mumkin: yangi endpointni sinaymiz.
+        for lookup_title in dict.fromkeys(v for v in (original, title) if v):
+            search = await self.get(f"{base}/api/v2.2/films",
+                                    {"keyword": lookup_title, "page": 1}, headers)
+            candidates = search.get("items") or []
+            ranked = []
+            for item in candidates:
+                film_id = item.get("kinopoiskId")
+                if not film_id:
+                    continue
+                if year != "—" and str(item.get("year") or "") != year:
+                    continue
+                names = {norm(item.get(k)) for k in ("nameEn", "nameOriginal", "nameRu")} - {""}
+                exact = bool(names & expected)
+                similarity = max((SequenceMatcher(None, a, b).ratio()
+                                  for a in expected for b in names), default=0)
+                if exact or similarity >= 0.82:
+                    ranked.append((int(exact), similarity, int(film_id)))
+            ranked.sort(reverse=True)
+            for _, _, film_id in ranked[:4]:
+                detail, matched_id = await validated(film_id)
+                if detail:
+                    return detail, matched_id
+        return {}, None
 
 API = MovieAPI()
 
@@ -480,13 +555,19 @@ async def make_caption(movie_id: int) -> str:
     d = await API.details(movie_id)
     if not d or not d.get("id"):
         return "TMDB ma’lumotlarini olib bo‘lmadi. Keyinroq qayta urinib ko‘ring."
-    imdb_id = (d.get("external_ids") or {}).get("imdb_id") or d.get("imdb_id")
+    verified = VERIFIED_EXTERNAL_IDS.get(movie_id, {})
+    imdb_id = ((d.get("external_ids") or {}).get("imdb_id")
+               or d.get("imdb_id") or verified.get("imdb"))
+    if not imdb_id:
+        # TMDB ba'zan /movie/{id} bilan IMDb ID qaytarmaydi.
+        external = await API.tmdb(f"/movie/{movie_id}/external_ids")
+        imdb_id = external.get("imdb_id") or None
     date = str(d.get("release_date") or "")
     year = date[:4] or "—"
     omdb, kp_result = await asyncio.gather(
         API.imdb(imdb_id),
         API.kinopoisk(str(d.get("title") or ""), str(d.get("original_title") or ""),
-                      year, imdb_id),
+                      year, imdb_id, verified.get("kinopoisk")),
     )
     kp, kp_id = kp_result
     tmdb_link = f'https://www.themoviedb.org/movie/{movie_id}'
@@ -497,10 +578,18 @@ async def make_caption(movie_id: int) -> str:
     tmdb_genres = genre_line(d.get("genres") or [])
     omdb_country = country_list(omdb.get("Country") or "")
     omdb_genres = genre_list(omdb.get("Genre") or "")
+    # Manba topilmasa IMDb bo‘limi havola/reytin'gi alohida ko‘rsatiladi.
+    # Davlat, yosh va janrlarni boshqa manbadan IMDbniki deb ko‘chirmaymiz.
     kp_countries = country_line(kp.get("countries") or [], "country")
     kp_genres = genre_line(kp.get("genres") or [], "genre")
     kp_age = age_from_rating(kp.get("ratingAgeLimits"))
     imdb_rating = rating_str(omdb.get("imdbRating"))
+    if imdb_rating == "Mavjud emas":
+        # OMDb ayniqsa yangi filmlarni kech qo‘shishi mumkin.
+        # Avval Kinopoisk beradigan IMDb reytingini tekshiramiz.
+        imdb_rating = rating_str(kp.get("ratingImdb"))
+        if imdb_rating == "Mavjud emas":
+            imdb_rating = rating_str(await API.imdb_rating_fallback(imdb_id))
     kp_rating = rating_str(kp.get("ratingKinopoisk"))
     def heading(name: str, link: Optional[str]) -> str:
         return f'<b><a href="{link}">{name}</a></b>' if link else f'<b>{name}</b> (havola mavjud emas)'
