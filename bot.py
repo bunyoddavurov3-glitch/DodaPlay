@@ -313,11 +313,21 @@ class MovieAPI:
 
 API = MovieAPI()
 
+def local_country(name: str) -> str:
+    raw = str(name or "").strip()
+    return COUNTRIES.get(raw.upper(), (None, raw))[1] or raw
+
+
+def country_list(value: str) -> str:
+    parts = [local_country(part) for part in str(value or "").split(",") if part.strip()]
+    return ", ".join(dict.fromkeys(parts)) if parts else "Mavjud emas"
+
+
 def country_line(items: list[dict], key: str) -> str:
     names = []
     for x in items:
         code = str(x.get("iso_3166_1") or x.get("countryCode") or "").upper()
-        name = COUNTRY_BY_ISO.get(code) or str(x.get(key) or "")
+        name = COUNTRY_BY_ISO.get(code) or local_country(x.get(key) or "")
         if name and name not in names:
             names.append(name)
     return ", ".join(names) if names else "Mavjud emas"
@@ -337,7 +347,7 @@ def age_from_rating(raw: Any) -> str:
         return "Mavjud emas"
     if text in RATING_AGES:
         return RATING_AGES[text]
-    m = re.search(r"\b(0|6|7|12|13|14|16|17|18|21)\+?\b", text)
+    m = re.search(r"(?:^|[^0-9])(0|6|7|12|13|14|16|17|18|21)\+?(?:$|[^0-9])", text)
     return f"{m.group(1)}+" if m else "Mavjud emas"
 
 def tmdb_age(details: dict) -> str:
@@ -384,7 +394,7 @@ async def make_caption(movie_id: int) -> str:
 
     tmdb_countries = country_line(d.get("production_countries") or [], "name")
     tmdb_genres = genre_line(d.get("genres") or [])
-    omdb_country = str(omdb.get("Country") or "").strip() or "Mavjud emas"
+    omdb_country = country_list(omdb.get("Country") or "")
     omdb_genres = ", ".join(
         GENRES.get(x.strip(), x.strip()) for x in str(omdb.get("Genre") or "").split(",")
         if x.strip()
