@@ -191,6 +191,39 @@ class AccessDB:
             (uid, status, int(time.time())), write=True,
         )
 
+    def approved_count(self) -> int:
+        return int(self._execute(
+            "SELECT COUNT(*) FROM approvals WHERE status=?", ("yes",)
+        ) or 0)
+
+    def approved_users(self, page: int, size: int = 8) -> list[tuple[int, int]]:
+        """Doimiy bazadan faqat ruxsatli foydalanuvchilarni olish."""
+        sql = ("SELECT user_id, updated_at FROM approvals WHERE status=? "
+               "ORDER BY updated_at DESC, user_id DESC LIMIT ? OFFSET ?")
+        args = ("yes", size, max(0, page) * size)
+        if self.pg:
+            with pg_connect(DATABASE_URL, connect_timeout=8) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql.replace("?", "%s"), args)
+                    return [(int(uid), int(ts)) for uid, ts in cur.fetchall()]
+        with sqlite3.connect(SQLITE_PATH, timeout=10) as conn:
+            return [(int(uid), int(ts)) for uid, ts in conn.execute(sql, args).fetchall()]
+
+    def delete_approved_user(self, uid: int) -> bool:
+        """Foydalanuvchini bazadan o‘chirish uning oddiy va inline ruxsatini bekor qiladi."""
+        if uid in ADMINS:
+            return False
+        sql = "DELETE FROM approvals WHERE user_id=? AND status=?"
+        args = (uid, "yes")
+        if self.pg:
+            with pg_connect(DATABASE_URL, connect_timeout=8) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql.replace("?", "%s"), args)
+                    return cur.rowcount > 0
+        with sqlite3.connect(SQLITE_PATH, timeout=10) as conn:
+            cur = conn.execute(sql, args)
+            return cur.rowcount > 0
+
 DB: Optional[AccessDB] = None
 
 async def authorized(uid: int) -> bool:
@@ -497,17 +530,135 @@ def choice_keyboard(items: list[MovieOption]) -> InlineKeyboardMarkup:
         for m in items[:5]
     ])
 
+# ================== ADMIN ACCESS PANEL ==================
+ADMIN_USERS_PAGE_SIZE = 8
+
+
+def admin_panel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Foydalanuvchilar ro‘yxati", callback_data="admin:users:0")],
+    ])
+
+
+async def admin_users_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    assert DB is not None
+    count = await asyncio.to_thread(DB.approved_count)
+    max_page = max(0, (count - 1) // ADMIN_USERS_PAGE_SIZE)
+    page = min(max(0, page), max_page)
+    entries = await asyncio.to_thread(DB.approved_users, page, ADMIN_USERS_PAGE_SIZE)
+    text = (f"👥 <b>Ruxsat berilgan foydalanuvchilar</b>\n"
+            f"Jami: <b>{count}</b>\nSahifa: {page + 1}/{max_page + 1}\n\n")
+    rows = []
+    if entries:
+        text += "\n".join(
+            f"{page * ADMIN_USERS_PAGE_SIZE + i}. ID: <code>{uid}</code>"
+            for i, (uid, _) in enumerate(entries, start=1)
+        )
+        for uid, _ in entries:
+            rows.append([InlineKeyboardButton(
+                text=f"🗑 {uid} — o‘chirish",
+                callback_data=f"admin:remove:{uid}:{page}",
+            )])
+    else:
+        text += "Hozircha ruxsat berilgan foydalanuvchilar yo‘q."
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            text="⬅️ Oldingi", callback_data=f"admin:users:{page - 1}"
+        ))
+    if page < max_page:
+        nav.append(InlineKeyboardButton(
+            text="Keyingi ➡️", callback_data=f"admin:users:{page + 1}"
+        ))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🏠 Admin panel", callback_data="admin:home")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@ROUTER.message(Command("admin", "users"))
+async def admin_panel(message: types.Message) -> None:
+    if message.chat.type != "private" or not message.from_user or message.from_user.id not in ADMINS:
+        await message.answer("⛔ Admin panel faqat admin uchun.")
+        return
+    await message.answer("🛡 <b>DodaPlay admin paneli</b>", reply_markup=admin_panel_kb())
+
+
+@ROUTER.callback_query(F.data.startswith("admin:"))
+async def admin_actions(call: types.CallbackQuery, bot: Bot) -> None:
+    if not call.from_user or call.from_user.id not in ADMINS:
+        await call.answer("⛔ Faqat admin uchun.", show_alert=True)
+        return
+    if not call.message or call.message.chat.type != "private":
+        await call.answer("⛔ Panel faqat shaxsiy chatda ishlaydi.", show_alert=True)
+        return
+    parts = (call.data or "").split(":")
+    assert DB is not None
+    try:
+        action = parts[1]
+        if action == "home" and len(parts) == 2:
+            text, markup = "🛡 <b>DodaPlay admin paneli</b>", admin_panel_kb()
+        elif action == "users" and len(parts) == 3:
+            text, markup = await admin_users_view(int(parts[2]))
+        elif action == "remove" and len(parts) == 4:
+            uid, page = int(parts[2]), int(parts[3])
+            if uid in ADMINS or await asyncio.to_thread(DB.status, uid) != "yes":
+                await call.answer("Foydalanuvchi topilmadi yoki admin.", show_alert=True)
+                return
+            text = (f"⚠️ <b>Foydalanuvchini o‘chirishni tasdiqlaysizmi?</b>\n"
+                    f"ID: <code>{uid}</code>\n\n"
+                    "U bot va inline qidiruvdan foydalanish huquqini yo‘qotadi.")
+            markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Ha, o‘chirish",
+                                      callback_data=f"admin:confirm:{uid}:{page}")],
+                [InlineKeyboardButton(text="↩️ Bekor qilish",
+                                      callback_data=f"admin:users:{page}")],
+            ])
+        elif action == "confirm" and len(parts) == 4:
+            uid, page = int(parts[2]), int(parts[3])
+            deleted = await asyncio.to_thread(DB.delete_approved_user, uid)
+            text, markup = await admin_users_view(page)
+            text = (f"{'✅ Foydalanuvchi o‘chirildi.' if deleted else 'ℹ️ Foydalanuvchi avval o‘chirilgan.'}"
+                    f"\nID: <code>{uid}</code>\n\n" + text)
+            if deleted:
+                try:
+                    await bot.send_message(
+                        uid, "⛔ Administrator DodaPlay botiga kirish ruxsatingizni bekor qildi."
+                    )
+                except Exception:
+                    LOG.info("Removed user %s could not be notified.", uid)
+        else:
+            await call.answer("Noto‘g‘ri tugma.", show_alert=True)
+            return
+        await call.message.edit_text(text, reply_markup=markup)
+        await call.answer()
+    except (ValueError, IndexError):
+        await call.answer("Noto‘g‘ri so‘rov.", show_alert=True)
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            await call.answer()
+        else:
+            LOG.exception("Admin panel Telegram edit failed")
+            await call.answer("Panelni yangilab bo‘lmadi.", show_alert=True)
+    except Exception:
+        LOG.exception("Admin panel failed")
+        await call.answer("Admin panelda xatolik yuz berdi.", show_alert=True)
+
+
 @ROUTER.message(CommandStart())
 async def start(message: types.Message, bot: Bot) -> None:
     user = message.from_user
     if not user:
         return
     if await authorized(user.id):
-        await message.answer(
-            "✅ DodaPlay'ga xush kelibsiz! Film nomini yuboring.\n"
-            "Masalan: Knives Out 2019 AQSH\n\n"
-            "Inline rejim: @DodaPlayAiBot Knives Out 2019",
-        )
+        welcome = ("✅ DodaPlay'ga xush kelibsiz! Film nomini yuboring.\n"
+                   "Masalan: Knives Out 2019 AQSH\n\n"
+                   "Inline rejim: @DodaPlayAiBot Knives Out 2019")
+        if user.id in ADMINS:
+            await message.answer(welcome + "\n\n🛡 Admin panel: /admin",
+                                 reply_markup=admin_panel_kb())
+        else:
+            await message.answer(welcome)
         return
     assert DB is not None
     status = await asyncio.to_thread(DB.status, user.id)
