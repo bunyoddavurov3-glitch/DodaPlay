@@ -245,6 +245,7 @@ class MovieOption:
     date: str
     popularity: float
     vote_count: int = 0
+    country_verified: bool = False
 
     @property
     def label(self) -> str:
@@ -304,7 +305,7 @@ class MovieAPI:
                     continue
                 movie_id = int(x["id"])
                 raw_date = str(x.get("release_date") or "")
-                date = raw_date if re.fullmatch(r"\\d{4}-\\d{2}-\\d{2}", raw_date) else ""
+                date = raw_date if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_date) else ""
                 names = (str(x.get("title") or ""), str(x.get("original_title") or ""))
                 similarity = max(
                     (SequenceMatcher(None, target, norm(name)).ratio()
@@ -375,6 +376,8 @@ class MovieAPI:
             )
             filtered = [m for m, yes in zip(items[:18], matched) if yes]
             if filtered:
+                for item in filtered:
+                    item.country_verified = True
                 items = filtered
             # If country is absent in TMDB, show name-based candidates
             # for explicit user choice, never auto-select a wrong country.
@@ -917,8 +920,15 @@ async def query_private(message: types.Message) -> None:
             return
         # Single exact result even if partial/unrelated alternatives are present.
         exact = [m for m in items if norm(title) in (norm(m.title), norm(m.original_title))]
-        if len(items) == 1 or len(exact) == 1:
-            await message.answer(await make_caption((exact or items)[0].tmdb_id),
+        chosen = (exact or items)[0]
+        _, requested_year, requested_country = parse_search(query)
+        safe_auto = (
+            (len(items) == 1 or len(exact) == 1)
+            and (not requested_year or chosen.year == str(requested_year))
+            and (not requested_country or chosen.country_verified)
+        )
+        if safe_auto:
+            await message.answer(await make_caption(chosen.tmdb_id),
                                  parse_mode="HTML", disable_web_page_preview=True)
             return
         await message.answer(
