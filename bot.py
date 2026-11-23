@@ -42,6 +42,7 @@ CACHE_MAX = 800
 # tasdiqlangan istisnolar. Qolgan barcha filmlar API orqali aniqlanadi.
 VERIFIED_EXTERNAL_IDS = {
     1384514: {"imdb": "tt34498564", "kinopoisk": 14246389},
+    1163194: {"imdb": "tt21626284", "kinopoisk": 5122593},
 }
 
 COUNTRIES = {
@@ -286,7 +287,7 @@ class MovieAPI:
 
     async def details(self, movie_id: int) -> dict:
         return await self.tmdb(f"/movie/{movie_id}", {
-            "append_to_response": "external_ids,release_dates",
+            "append_to_response": "external_ids,release_dates,alternative_titles",
         })
 
     async def search(self, text: str) -> list[MovieOption]:
@@ -406,70 +407,104 @@ class MovieAPI:
 
     async def kinopoisk(self, title: str, original: str,
                        year: str, imdb_id: Optional[str],
-                       known_id: Optional[int] = None) -> tuple[dict, Optional[int]]:
+                       known_id: Optional[int] = None,
+                       aliases: Optional[list[str]] = None) -> tuple[dict, Optional[int]]:
         if not KP_KEY:
             return {}, None
         headers = {"X-API-KEY": KP_KEY, "Accept": "application/json"}
         base = "https://kinopoiskapiunofficial.tech"
-        expected = {norm(title), norm(original)} - {""}
+        names = list(dict.fromkeys(
+            value.strip() for value in [original, title, *(aliases or [])]
+            if isinstance(value, str) and value.strip()
+        ))
+        expected = {norm(name) for name in names if norm(name)}
+        try:
+            target_year = int(year)
+        except (TypeError, ValueError):
+            target_year = 0
+
+        def year_gap(value: Any) -> Optional[int]:
+            try:
+                candidate_year = int(value)
+                return abs(candidate_year - target_year) if target_year else 0
+            except (TypeError, ValueError):
+                return None
 
         async def validated(film_id: int) -> tuple[dict, Optional[int]]:
             detail = await self.get(f"{base}/api/v2.2/films/{film_id}", headers=headers)
             if not detail or not detail.get("kinopoiskId"):
                 return {}, None
             found_imdb = str(detail.get("imdbId") or "")
+            # Turli platformalar yili 1-2 yil farq qilishi mumkin.
+            # Lekin IMDb ID farq qilsa, uni HECH QACHON qabul qilmaymiz.
             if imdb_id and found_imdb and found_imdb != imdb_id:
                 return {}, None
-            if year != "—" and str(detail.get("year") or "") != year:
-                return {}, None
-            names = {norm(detail.get(k)) for k in ("nameEn", "nameOriginal", "nameRu")} - {""}
-            # ISBN kabi IDga emas, tasdiqlangan IMDb ID yoki yaqin nomga ishonamiz.
             same_imdb = bool(imdb_id and found_imdb == imdb_id)
-            similarity = max((SequenceMatcher(None, a, b).ratio()
-                              for a in expected for b in names), default=0)
-            if not (same_imdb or similarity >= 0.84 or (known_id and film_id == known_id)):
+            supplied_id = bool(known_id and film_id == known_id)
+            film_names = {
+                norm(detail.get(key)) for key in ("nameEn", "nameOriginal", "nameRu")
+            } - {""}
+            similarity = max(
+                (SequenceMatcher(None, left, right).ratio()
+                 for left in expected for right in film_names), default=0.0,
+            )
+            gap = year_gap(detail.get("year"))
+            # Verified IDs and IMDb matches are stronger than release year.
+            if supplied_id or same_imdb:
+                return detail, film_id
+            # Without a reliable cross-source ID require an almost identical
+            # alternate title and a close release year; never pair a distant
+            # remake just because names match.
+            if gap is None or gap > 2 or similarity < 0.90:
                 return {}, None
             return detail, film_id
 
         if known_id:
-            detail, matched_id = await validated(known_id)
-            if detail:
-                return detail, matched_id
+            matched, match_id = await validated(known_id)
+            if matched:
+                return matched, match_id
 
-        # Eng aniq usul — IMDb ID; nom bir tilda boshqacha bo‘lsa ham topiladi.
         if imdb_id:
-            filtered = await self.get(f"{base}/api/v2.2/films",
-                                      {"imdbId": imdb_id, "page": 1}, headers)
-            for item in (filtered.get("items") or [])[:10]:
+            by_imdb = await self.get(
+                f"{base}/api/v2.2/films", {"imdbId": imdb_id, "page": 1}, headers
+            )
+            # Some API versions ignore imdbId filter: check returned records.
+            for item in (by_imdb.get("items") or [])[:12]:
                 film_id = item.get("kinopoiskId")
                 if film_id:
-                    detail, matched_id = await validated(int(film_id))
-                    if detail:
-                        return detail, matched_id
+                    matched, match_id = await validated(int(film_id))
+                    if matched:
+                        return matched, match_id
 
-        # Eski keyword endpoint 500 qaytarishi mumkin: yangi endpointni sinaymiz.
-        for lookup_title in dict.fromkeys(v for v in (original, title) if v):
-            search = await self.get(f"{base}/api/v2.2/films",
-                                    {"keyword": lookup_title, "page": 1}, headers)
-            candidates = search.get("items") or []
+        # TMDB provides release-specific aliases (including Russian titles).
+        # Limit lookups so short inline queries don't exhaust API quotas.
+        for lookup_title in names[:5]:
+            response = await self.get(
+                f"{base}/api/v2.2/films", {"keyword": lookup_title, "page": 1}, headers
+            )
             ranked = []
-            for item in candidates:
+            for item in (response.get("items") or []):
                 film_id = item.get("kinopoiskId")
                 if not film_id:
                     continue
-                if year != "—" and str(item.get("year") or "") != year:
+                gap = year_gap(item.get("year"))
+                if gap is None or gap > 2:
                     continue
-                names = {norm(item.get(k)) for k in ("nameEn", "nameOriginal", "nameRu")} - {""}
-                exact = bool(names & expected)
-                similarity = max((SequenceMatcher(None, a, b).ratio()
-                                  for a in expected for b in names), default=0)
-                if exact or similarity >= 0.82:
-                    ranked.append((int(exact), similarity, int(film_id)))
+                candidate_names = {
+                    norm(item.get(key)) for key in ("nameEn", "nameOriginal", "nameRu")
+                } - {""}
+                similarity = max(
+                    (SequenceMatcher(None, left, right).ratio()
+                     for left in expected for right in candidate_names),
+                    default=0.0,
+                )
+                if similarity >= 0.85:
+                    ranked.append((similarity, -gap, int(film_id)))
             ranked.sort(reverse=True)
-            for _, _, film_id in ranked[:4]:
-                detail, matched_id = await validated(film_id)
-                if detail:
-                    return detail, matched_id
+            for _, _, film_id in ranked[:3]:
+                matched, match_id = await validated(film_id)
+                if matched:
+                    return matched, match_id
         return {}, None
 
 API = MovieAPI()
@@ -564,10 +599,22 @@ async def make_caption(movie_id: int) -> str:
         imdb_id = external.get("imdb_id") or None
     date = str(d.get("release_date") or "")
     year = date[:4] or "—"
+    alternatives = [
+        str(item.get("title") or "")
+        for item in (d.get("alternative_titles") or {}).get("titles") or []
+        if isinstance(item, dict) and item.get("title")
+    ]
+    # Russian is especially important for Kinopoisk; original names first.
+    ru_aliases = [
+        str(item.get("title") or "")
+        for item in (d.get("alternative_titles") or {}).get("titles") or []
+        if isinstance(item, dict) and item.get("iso_3166_1") == "RU"
+    ]
+    aliases = list(dict.fromkeys(ru_aliases + alternatives))[:12]
     omdb, kp_result = await asyncio.gather(
         API.imdb(imdb_id),
         API.kinopoisk(str(d.get("title") or ""), str(d.get("original_title") or ""),
-                      year, imdb_id, verified.get("kinopoisk")),
+                      year, imdb_id, verified.get("kinopoisk"), aliases),
     )
     kp, kp_id = kp_result
     tmdb_link = f'https://www.themoviedb.org/movie/{movie_id}'
