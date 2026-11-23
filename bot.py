@@ -294,68 +294,91 @@ class MovieAPI:
         title, year, country = parse_search(text)
         if not title:
             return []
+        target = norm(title)
+        seen: dict[int, MovieOption] = {}
+
+        async def search_page(params: dict, language: str = "en-US") -> None:
+            payload = await self.tmdb("/search/movie", dict(params, language=language))
+            for x in payload.get("results") or []:
+                if not isinstance(x, dict) or not x.get("id"):
+                    continue
+                movie_id = int(x["id"])
+                raw_date = str(x.get("release_date") or "")
+                date = raw_date if re.fullmatch(r"\\d{4}-\\d{2}-\\d{2}", raw_date) else ""
+                names = (str(x.get("title") or ""), str(x.get("original_title") or ""))
+                similarity = max(
+                    (SequenceMatcher(None, target, norm(name)).ratio()
+                     for name in names if name), default=0.0
+                )
+                is_related = (
+                    target in [norm(n) for n in names] or
+                    any(target in norm(name) for name in names if name) or
+                    similarity >= 0.68
+                )
+                if not is_related:
+                    continue
+                current = seen.get(movie_id)
+                if current:
+                    # Prefer an English display title when it exists.
+                    continue
+                seen[movie_id] = MovieOption(
+                    tmdb_id=movie_id, title=names[0] or names[1],
+                    original_title=names[1], year=date[:4] or "—",
+                    date=date, popularity=float(x.get("popularity") or 0),
+                    vote_count=int(x.get("vote_count") or 0),
+                )
+
         params: dict[str, Any] = {"query": title, "include_adult": "false"}
         if year:
             params["year"] = year
+        await search_page(params)
+        if not year:
+            # First two pages are enough for broad searches without excess calls.
+            await search_page(dict(params, page=2))
+        elif not any(m.year == str(year) for m in seen.values()):
+            # TMDB / IMDb / Kinopoisk year may differ for festival vs wide release.
+            # Retry WITHOUT strict year and keep nearby matches as choices.
+            await search_page({"query": title, "include_adult": "false"})
+        if not seen:
+            # TMDB aliases in Cyrillic and English can be indexed differently.
+            await search_page({"query": title, "include_adult": "false"}, "ru-RU")
+        if not seen:
+            return []
 
-        # TMDB qidiruvi mashhur trilogiya qismlarini birinchi sahifada
-        # bermasligi mumkin. Yilsiz keng qidiruvda faqat 2 sahifa tekshiriladi.
-        first = await self.tmdb("/search/movie", params)
-        raw = list(first.get("results") or [])
-        if not year and int(first.get("total_pages") or 1) > 1:
-            second = await self.tmdb("/search/movie", dict(params, page=2))
-            raw.extend(second.get("results") or [])
-
-        items = []
-        seen: set[int] = set()
-        for x in raw:
-            if not isinstance(x, dict) or not x.get("id"):
-                continue
-            movie_id = int(x["id"])
-            if movie_id in seen:
-                continue
-            seen.add(movie_id)
-            date = str(x.get("release_date") or "")
-            # Noto‘g‘ri yoki to‘liq bo‘lmagan sanaga aniq yil bermaymiz.
-            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
-                date = ""
-            if year and not date.startswith(str(year)):
-                continue
-            items.append(MovieOption(
-                tmdb_id=movie_id, title=str(x.get("title") or ""),
-                original_title=str(x.get("original_title") or ""),
-                year=date[:4] or "—", date=date,
-                popularity=float(x.get("popularity") or 0),
-                vote_count=int(x.get("vote_count") or 0),
-            ))
-
-        target = norm(title)
-        def score(m: MovieOption) -> tuple:
+        items = list(seen.values())
+        def relevance(m: MovieOption) -> tuple:
             names = (norm(m.title), norm(m.original_title))
-            exact = target in names
-            # Nomdan keyin bo‘lim/qo‘shimcha nom bo‘lsa, uni tegishli davom
-            # sifatida ko‘ramiz; qisqa fanfilmni reytingga ko‘tarib yubormaymiz.
-            prefix = any(n.startswith(target) for n in names if n)
-            similarity = max(SequenceMatcher(None, target, n).ratio()
-                             for n in names if n) if any(names) else 0.0
-            year_known = bool(m.date)
-            return (int(exact), int(prefix), int(year_known),
-                    m.vote_count, similarity, m.popularity)
+            exact = int(target in names)
+            contains = int(any(target in name for name in names if name))
+            similar = max(
+                (SequenceMatcher(None, target, name).ratio()
+                 for name in names if name), default=0.0
+            )
+            return (exact, contains, similar, m.vote_count, m.popularity)
 
-        # Mamlakat filt­ridan oldin ham relevant nomlar saralanadi.
-        items.sort(key=score, reverse=True)
+        items.sort(key=relevance, reverse=True)
+        if year:
+            close = [m for m in items
+                     if m.year != "—" and abs(int(m.year) - year) <= 2]
+            if close:
+                items = close
+            # If no year is close, still show related titles as choices,
+            # instead of silently claiming the film doesn't exist.
         if country:
             async def in_country(opt: MovieOption) -> bool:
                 d = await self.details(opt.tmdb_id)
                 codes = {str(z.get("iso_3166_1") or "").upper()
                          for z in d.get("production_countries") or []}
                 return country in codes
-            relevant = items[:18]
-            matched = await asyncio.gather(*(in_country(item) for item in relevant))
-            items = [item for item, yes in zip(relevant, matched) if yes]
-        # Taklif variantlari qat'iy yangi yildan eski yilga qarab chiqadi.
-        # Sana topilmagan natija eng oxirida ko'rsatiladi.
-        items.sort(key=lambda item: item.date or "0000-00-00", reverse=True)
+            matched = await asyncio.gather(
+                *(in_country(item) for item in items[:18])
+            )
+            filtered = [m for m, yes in zip(items[:18], matched) if yes]
+            if filtered:
+                items = filtered
+            # If country is absent in TMDB, show name-based candidates
+            # for explicit user choice, never auto-select a wrong country.
+        items.sort(key=lambda m: m.date or "0000-00-00", reverse=True)
         return items[:5]
 
     async def imdb(self, imdb_id: Optional[str]) -> dict:
