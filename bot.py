@@ -497,7 +497,19 @@ class MovieAPI:
             # Some API versions ignore imdbId filter: check returned records.
             for item in (by_imdb.get("items") or [])[:12]:
                 film_id = item.get("kinopoiskId")
-                if film_id:
+                item_imdb = str(item.get("imdbId") or "")
+                if not film_id or (item_imdb and item_imdb != imdb_id):
+                    continue
+                candidate_names = {
+                    norm(item.get(key)) for key in ("nameEn", "nameOriginal", "nameRu")
+                } - {""}
+                similarity = max(
+                    (SequenceMatcher(None, left, right).ratio()
+                     for left in expected for right in candidate_names),
+                    default=0.0
+                )
+                # On some API versions imdbId is ignored; don't fetch random movies.
+                if item_imdb == imdb_id or similarity >= 0.86:
                     matched, match_id = await validated(int(film_id))
                     if matched:
                         return matched, match_id
